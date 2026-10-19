@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""mutcheck: mutation testing for a Python module, standard library only.
+
+Plants one small bug at a time in MODULE.py (flipped comparisons, and/or swapped, `not` removed,
+numbers off by one, True/False swapped, + and - swapped), runs the test command against each copy,
+and lists the bugs the tests did not catch ("survivors"). A strong test suite catches nearly all.
+
+  mutcheck [--min-score PCT] [--timeout S] [--max N] [--jobs N] [--all] MODULE.py -- TEST COMMAND...
+
+Run it from the project root. Exit status 0 when the share of caught mutants is at least --min-score
+(default 100), 1 otherwise, 2 when the tests fail even without a planted bug. Some mutants change
+nothing observable ("equivalent mutants"): judge the listed survivors before chasing 100%.
+"""
+import argparse, ast, concurrent.futures, os, shutil, subprocess, sys, tempfile
+
+SWAP_CMP = {ast.Lt: ast.LtE, ast.LtE: ast.Lt, ast.Gt: ast.GtE, ast.GtE: ast.Gt, ast.Eq: ast.NotEq,
+            ast.NotEq: ast.Eq, ast.Is: ast.IsNot, ast.IsNot: ast.Is, ast.In: ast.NotIn, ast.NotIn: ast.In}
+SWAP_BIN = {ast.Add: ast.Sub, ast.Sub: ast.Add}
+
+
+def sites(tree):
+    """(walk index, kind, detail) for every place a bug can be planted, in a deterministic order."""
+    out = []
+    for i, node in enumerate(ast.walk(tree)):
+        if isinstance(node, ast.Compare):
+            out += [(i, "cmp", k) for k, op in enumerate(node.ops) if type(op) in SWAP_CMP]
+        elif isinstance(node, ast.BoolOp):
+            out.append((i, "bool", None))
+        elif isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+            out.append((i, "not", None))
+        elif isinstance(node, ast.Constant) and type(node.value) in (bool, int):
+            out.append((i, "const", None))
+        elif isinstance(node, (ast.BinOp, ast.AugAssign)) and type(node.op) in SWAP_BIN:
+            out.append((i, "binop", None))
+    return out
+
+
+def mutate(source, site):
+    """Source code with one planted bug, plus a one-line description of it."""
+    tree = ast.parse(source)
+    index, kind, detail = site
+    node = next(n for k, n in enumerate(ast.walk(tree)) if k == index)
+    before = ast.get_source_segment(source, node) or ast.unparse(node)
+    if kind == "cmp":
+        node.ops[detail] = SWAP_CMP[type(node.ops[detail])]()
+    elif kind == "bool":
+        node.op = ast.Or() if isinstance(node.op, ast.And) else ast.And()
+    elif kind == "not":
+        # replace `not x` by `x` inside its parent
+        for parent in ast.walk(tree):
+            for field, value in ast.iter_fields(parent):
+                if value is node:
+                    setattr(parent, field, node.operand)
+                elif isinstance(value, list) and node in value:
+                    value[value.index(node)] = node.operand
+        after = ast.unparse(node.operand)
+        return ast.unparse(tree), node.lineno, before, after
+    elif kind == "const":
+        node.value = (not node.value) if isinstance(node.value, bool) else node.value + 1
+    elif kind == "binop":
+        node.op = SWAP_BIN[type(node.op)]()
+    return ast.unparse(tree), node.lineno, before, ast.unparse(node)
+
+
+def short(text, n=70):
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Mutation testing for a Python module (standard library only).")
+    ap.add_argument("--min-score", type=float, default=100.0, help="percent of mutants that must be caught (default 100)")
+    ap.add_argument("--timeout", type=float, default=20.0, help="seconds per test run; a hang counts as caught (default 20)")
+    ap.add_argument("--max", type=int, default=400, help="test at most this many mutants, spread over the file (default 400)")
+    ap.add_argument("--jobs", type=int, default=os.cpu_count() or 4, help="parallel test runs")
+    ap.add_argument("--all", action="store_true", help="list every survivor (default: the first 12)")
+    ap.add_argument("module")
+    ap.add_argument("test", nargs=argparse.REMAINDER)
+    args = ap.parse_args()
+    test = args.test[1:] if args.test[:1] == ["--"] else args.test
+    if not test:
+        ap.error("give the test command after --")
+    root = os.getcwd()
+    rel = os.path.relpath(os.path.abspath(args.module), root)
+    if rel.startswith(".."):
+        ap.error("run mutcheck from the project root that contains the module")
+    source = open(args.module).read()
+    all_sites = sites(ast.parse(source))
+    if len(all_sites) > args.max:
+        step = len(all_sites) / args.max
+        all_sites = [all_sites[int(k * step)] for k in range(args.max)]
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    ignore = shutil.ignore_patterns(".git", "__pycache__", "*.pyc")
+    workdirs = []
+
+    def run(workdir, text):
+        with open(os.path.join(workdir, rel), "w") as f:
+            f.write(text)
+        try:
+            return subprocess.run(test, cwd=workdir, env=env, stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL, timeout=args.timeout).returncode != 0
+        except subprocess.TimeoutExpired:
+            return True
+
+    try:
+        jobs = max(1, min(args.jobs, len(all_sites) or 1))
+        for _ in range(jobs):
+            d = tempfile.mkdtemp(prefix="mutcheck-")
+            shutil.copytree(root, os.path.join(d, "p"), ignore=ignore)
+            workdirs.append(os.path.join(d, "p"))
+        if run(workdirs[0], source):
+            print("mutcheck: the tests fail without any planted bug; fix them first.")
+            return 2
+        mutants = [mutate(source, s) for s in all_sites]
+        free = list(workdirs)
+        survivors = []
+
+        def check(m):
+            workdir = free.pop()
+            try:
+                return m, run(workdir, m[0])
+            finally:
+                free.append(workdir)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=jobs) as pool:
+            results = list(pool.map(check, mutants))
+        survivors = [m for m, caught in results if not caught]
+        total = len(results)
+        score = 100.0 * (total - len(survivors)) / total if total else 100.0
+        survivors.sort(key=lambda m: m[1])
+        shown = survivors if args.all else survivors[:12]
+        for _, line, before, after in shown:
+            print(f"  survived: line {line}: `{short(before)}` -> `{short(after)}`")
+        if len(shown) < len(survivors):
+            print(f"  ... {len(survivors) - len(shown)} more (use --all)")
+        verdict = "PASS" if score >= args.min_score else "FAIL"
+        print(f"mutcheck: {total} mutants, {total - len(survivors)} caught, {len(survivors)} survived: "
+              f"score {score:.1f}% (minimum {args.min_score:g}%) {verdict}")
+        return 0 if verdict == "PASS" else 1
+    finally:
+        for w in workdirs:
+            shutil.rmtree(os.path.dirname(w), ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

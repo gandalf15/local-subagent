@@ -1,0 +1,420 @@
+#!/bin/bash
+# =============================================
+# local-subagent  ← delegate a coding task to a local model (OpenCode, by default on Ollama)
+# The coordinating agent (or you) writes a task spec; the local model does the work in an isolated git
+# worktree; the coordinator gets a short report and decides to apply, send feedback, or discard.
+#
+#   local-subagent run [-n NAME] [-m MODEL] [-e EFFORT] [-t SECONDS] [-c 'ACCEPTANCE CMD']... [-a 'ADVISORY CMD']... [-r ROUNDS] [-T SECONDS] [-d] SPEC.md|-
+#       SPEC '-' reads the spec from stdin; -d adds the diff (first 150 lines, then an outline) to the report.
+#       -m sets the OpenCode model as provider/model (default: $LOCAL_SUBAGENT_MODEL, else the tested Qwen3.8 build).
+#       -e sets the model's thinking effort, for models that have levels (Qwen3.8: low, medium, xhigh). Without
+#       -e nothing is sent and the model uses its own default.
+#       When an acceptance check (-c) fails, the failure goes back to the model by itself: at most -r rounds
+#       (default 2), none after a round that changed nothing, none after the model timed out (-t SECONDS per
+#       model run, default 900), and all of it within -T SECONDS in total (default 1800).
+#       Advisory commands (-a) run once at the end and are only reported, for slow or best-effort measures
+#       such as test strength (mutcheck). The model never sees them, so it does not spend its time chasing them.
+#   local-subagent continue NAME 'FEEDBACK'     another round in the same session (same automatic rounds)
+#   local-subagent report [-w SECONDS] NAME     print the report again; while the task still runs (for example
+#                                               when it was started in the background), wait up to -w SECONDS
+#                                               (default 540) first
+#   local-subagent diff NAME                    full diff of the model's changes
+#   local-subagent apply NAME                   copy the changes into your working tree (uncommitted), clean up
+#   local-subagent discard NAME                 throw the task away
+#   local-subagent list                         tasks of this repository
+#
+# Run it inside a git repository. The worktree starts from HEAD, so uncommitted changes are not visible
+# to the model. Tasks run one at a time, because a GPU usually holds one such model.
+# =============================================
+
+set -euo pipefail
+
+MODEL="${LOCAL_SUBAGENT_MODEL:-ollama/qwen3.8:27b-gsq-iq3_s}"   # tested on a 16 GB GPU
+EFFORT=""           # thinking effort; empty sends nothing, so the model uses its own default
+TIMEOUT=900         # seconds per model run
+ROUNDS=2            # automatic fix rounds after failing checks
+BUDGET=1800         # seconds for all model runs of one command together
+DIFF_LINES=150      # diff lines shown in a report before the outline
+ACCEPT_TIMEOUT=600
+# Worker-only OpenCode rules (merged into ~/.config/opencode/opencode.json): stay inside the worktree,
+# no web, no questions (nobody is there to answer), no skills, stop on repeated identical tool calls.
+# run_opencode adds the task's model as small_model, so that session titles stay local too when OpenCode also
+# has a cloud provider for other uses, and the thinking effort for OpenCode's default agent when one was given.
+WORKER_CONFIG='{"permission":{"external_directory":"deny","webfetch":"deny","websearch":"deny","question":"deny","skill":"deny","doom_loop":"deny"}}'
+
+die() { echo "local-subagent: $*" >&2; exit 1; }
+
+# When local-subagent itself is stopped (for example by a coordinator's command timeout), stop the model too;
+# otherwise OpenCode keeps working in the worktree. timeout runs OpenCode in its own process group, so signal each
+# descendant directly. run_opencode waits in the background, so the trap runs right away.
+stop_children() {  # PID
+    local p
+    for p in $(pgrep -P "$1" 2>/dev/null); do stop_children "$p"; done
+    [ "$1" = $$ ] || kill -TERM "$1" 2>/dev/null || true
+}
+trap 'stop_children $$; exit 143' TERM INT HUP
+
+TOP=$(git rev-parse --show-toplevel 2>/dev/null) || die "run it inside a git repository"
+REPO_ID="$(basename "$TOP")-$(printf '%s' "$TOP" | sha256sum | cut -c1-8)"
+ROOT="${XDG_STATE_HOME:-$HOME/.local/state}/local-subagent/$REPO_ID"
+mkdir -p "$ROOT"
+
+task_dir() { [ -d "$ROOT/$1/wt" ] || die "no task '$1' (local-subagent list)"; echo "$ROOT/$1"; }
+
+# One model run at a time, across all repositories
+lock() {
+    exec 9>"${XDG_STATE_HOME:-$HOME/.local/state}/local-subagent/.lock"
+    flock -n 9 || { echo "local-subagent: waiting for another task to finish..." >&2; flock 9; }
+}
+
+# Run OpenCode headless in the worktree. stdin must be /dev/null, or `opencode run` waits for input forever.
+# The two DISABLE_*_SKILLS variables keep OpenCode from loading ~/.claude/skills and ~/.agents/skills,
+# where this skill itself lives: the worker must not delegate to itself.
+# PYTHONDONTWRITEBYTECODE keeps __pycache__ files out of the diff in repositories that do not ignore them.
+run_opencode() {  # TASK_DIR SECONDS MESSAGE [extra opencode args...]
+    local dir=$1 limit=$2 msg=$3; shift 3
+    local start rc=0
+    start=$(date +%s)
+    local model effort config
+    model=$(cat "$dir/model")
+    effort=$(cat "$dir/effort" 2>/dev/null || true)
+    config="${WORKER_CONFIG%\}},\"small_model\":\"$model\"}"
+    [ -z "$effort" ] || config="${config%\}},\"agent\":{\"build\":{\"reasoningEffort\":\"$effort\"}}}"
+    (cd "$dir/wt" && OPENCODE_CONFIG_CONTENT="$config" OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+        OPENCODE_DISABLE_AUTOUPDATE=1 PYTHONDONTWRITEBYTECODE=1 timeout "$limit" \
+        opencode run --auto -m "$model" --format json "$@" "$msg" \
+        < /dev/null >> "$dir/log.jsonl" 2>> "$dir/err") &
+    wait $! || rc=$?
+    echo $(( $(cat "$dir/model_seconds" 2>/dev/null || echo 0) + $(date +%s) - start )) > "$dir/model_seconds"
+    echo $(( $(cat "$dir/model_runs" 2>/dev/null || echo 0) + 1 )) > "$dir/model_runs"
+    echo "$rc" > "$dir/last_rc"
+    echo "$limit" > "$dir/last_limit"
+    grep -o '"sessionID":"[^"]*"' "$dir/log.jsonl" | head -n 1 | cut -d'"' -f4 > "$dir/session" || true
+}
+
+# True while a local-subagent process still works on the task (or waits for the lock). run and continue write their
+# process ID to TASK_DIR/pid and remove it when they finish; a pid file whose process is gone means it was killed.
+running() {  # TASK_DIR
+    local pid
+    pid=$(cat "$1/pid" 2>/dev/null) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null \
+        && grep -qas local-subagent "/proc/$pid/cmdline"   # not a reused process ID after a reboot
+}
+
+short() { local c=$1; echo "${c:0:70}$([ ${#c} -gt 70 ] && echo "…")"; }
+
+# Run one command in the worktree; sets the caller's $out and $crc.
+check() {  # TASK_DIR CMD
+    crc=0
+    out=$(cd "$1/wt" && PYTHONDONTWRITEBYTECODE=1 timeout "$ACCEPT_TIMEOUT" bash -c "$2" < /dev/null 2>&1) || crc=$?
+}
+
+# Run the acceptance commands in the worktree. Writes the report lines (checks.md), the feedback for the model
+# (failures) and a fingerprint of the failures (signature). Returns 1 when any check fails.
+run_checks() {  # TASK_DIR
+    local dir=$1 cmd out crc failed=0
+    : > "$dir/checks.md"; : > "$dir/failures"; : > "$dir/signature"
+    [ -s "$dir/accept" ] || return 0
+    while IFS= read -r cmd; do
+        check "$dir" "$cmd"
+        if [ "$crc" = 0 ]; then
+            echo "- \`$(short "$cmd")\` → PASS" >> "$dir/checks.md"
+        else
+            failed=1
+            { echo "- \`$(short "$cmd")\` → FAIL (exit $crc)"; printf '%s\n' "$out" | tail -n 15 | sed 's/^/    /'; } >> "$dir/checks.md"
+            { echo "Command: $cmd"; echo "Exit status: $crc"; echo "Last output:"; printf '%s\n' "$out" | tail -n 30; echo; } >> "$dir/failures"
+            { echo "$cmd"; printf '%s\n' "$out" | tail -n 1; } >> "$dir/signature"
+        fi
+    done < "$dir/accept"
+    git -C "$dir/wt" add -A   # include files the checks created, so diff/apply see them
+    return "$failed"
+}
+
+# Run the advisory commands once and keep their output for the report. They never go back to the model.
+run_advisory() {  # TASK_DIR
+    local dir=$1 cmd out crc
+    : > "$dir/advisory.md"
+    [ -s "$dir/advisory" ] || return 0
+    while IFS= read -r cmd; do
+        check "$dir" "$cmd"
+        { if [ "$crc" = 0 ]; then echo "- \`$(short "$cmd")\` → PASS"; else echo "- \`$(short "$cmd")\` → FAIL (exit $crc)"; fi
+          printf '%s\n' "$out" | tail -n 15 | sed 's/^/    /'; } >> "$dir/advisory.md"
+    done < "$dir/advisory"
+    git -C "$dir/wt" add -A
+}
+
+# One model run, then automatic fix rounds while checks fail, within the round, time and progress limits.
+# BUDGET is a hard cap: a fix round only gets the time that is left.
+work() {  # TASK_DIR MESSAGE [extra opencode args...]
+    local dir=$1 msg=$2; shift 2
+    local start left round=0 prev="" stop=""
+    start=$(date +%s)
+    run_opencode "$dir" "$(( TIMEOUT < BUDGET ? TIMEOUT : BUDGET ))" "$msg" "$@"
+    while ! run_checks "$dir"; do
+        left=$(( BUDGET - ($(date +%s) - start) ))
+        if [ "$(cat "$dir/last_rc")" = 124 ]; then stop="the model timed out"; break; fi
+        if [ "$round" -ge "$ROUNDS" ]; then stop="round limit ($ROUNDS) reached"; break; fi
+        if [ "$left" -lt 120 ]; then stop="time budget (${BUDGET} s) used up"; break; fi
+        if [ -n "$prev" ] && [ "$(cat "$dir/signature")" = "$prev" ]; then stop="the last round changed nothing"; break; fi
+        prev=$(cat "$dir/signature")
+        round=$((round + 1))
+        echo "local-subagent: checks failed; automatic fix round $round of $ROUNDS..." >&2
+        run_opencode "$dir" "$(( TIMEOUT < left ? TIMEOUT : left ))" "The acceptance checks still fail:
+
+$(cat "$dir/failures")
+Fix the cause. Do not weaken, skip or delete checks or tests to make them pass. Run the acceptance commands again, and finish with the same kind of short summary." -s "$(cat "$dir/session")"
+    done
+    echo "$round" > "$dir/auto_rounds"
+    printf '%s' "$stop" > "$dir/stop_reason"
+    run_advisory "$dir"
+}
+
+report() {  # TASK_DIR
+    local dir=$1 name rc
+    name=$(basename "$dir")
+    git -C "$dir/wt" add -A
+    echo "## local-subagent report: $name"
+    echo "- Worktree: $dir/wt (branch subagent/$name, base $(git -C "$dir/wt" rev-parse --short HEAD))"
+    rc=$(cat "$dir/last_rc" 2>/dev/null || echo "?")
+    echo "- Model: $(cat "$dir/model" 2>/dev/null), $(cat "$dir/model_runs" 2>/dev/null || echo 1) run(s), $(cat "$dir/model_seconds" 2>/dev/null || echo "?") s in total, last exit $rc$([ "$rc" = 124 ] && echo " (timed out after $(cat "$dir/last_limit" 2>/dev/null || echo "$TIMEOUT") s)")"
+    if [ -e "$dir/pid" ]; then
+        echo "- Interrupted: local-subagent was stopped before it finished, so the checks below may be missing or out of date"
+    elif [ -s "$dir/stop_reason" ]; then
+        echo "- Checks still fail after $(cat "$dir/auto_rounds" 2>/dev/null || echo 0) automatic fix round(s); stopped: $(cat "$dir/stop_reason")"
+    elif [ -s "$dir/accept" ]; then
+        echo "- All checks pass$([ "$(cat "$dir/auto_rounds" 2>/dev/null || echo 0)" != 0 ] && echo " after $(cat "$dir/auto_rounds") automatic fix round(s)")"
+    fi
+    python3 -I - "$dir/log.jsonl" "$rc" <<'EOF'
+import json, os, sys
+log, timed_out = sys.argv[1], sys.argv[2] == "124"
+session, steps, tools, errors, last_text = None, 0, 0, [], ""
+tok = {"input": 0, "output": 0, "cache_read": 0}
+for line in (open(log, encoding="utf-8", errors="replace") if os.path.exists(log) else []):
+    try:
+        e = json.loads(line)
+    except ValueError:
+        continue
+    session = session or e.get("sessionID")
+    part = e.get("part") or {}
+    if part.get("type") == "tool":
+        tools += 1
+        st = part.get("state") or {}
+        if st.get("status") == "error":
+            errors.append(f'{part.get("tool")}: {str(st.get("error"))[:150]}')
+    elif part.get("type") == "text" and part.get("text", "").strip():
+        last_text = part["text"].strip()
+    elif part.get("type") == "step-finish":
+        steps += 1
+        t = part.get("tokens") or {}
+        tok["input"] += t.get("input", 0); tok["output"] += t.get("output", 0)
+        tok["cache_read"] += (t.get("cache") or {}).get("read", 0)
+print(f"- Model work so far: {steps} steps, {tools} tool calls ({len(errors)} failed), "
+      f"{tok['input'] + tok['cache_read']:,} input tokens read ({tok['cache_read']:,} from cache), "
+      f"{tok['output']:,} tokens written")
+for err in errors[:5]:
+    print(f"  - failed: {err}")
+print("\n### The model's last message before the timeout (it may be unfinished)" if timed_out else "\n### The model's summary")
+print(last_text[:2000] + (" [...]" if len(last_text) > 2000 else "") if last_text else "(no final message)")
+EOF
+    echo
+    echo "### Changed files"
+    git -C "$dir/wt" diff --cached --stat | tail -n 30
+    [ -n "$(git -C "$dir/wt" diff --cached --name-only)" ] || echo "(none)"
+    if [ -s "$dir/accept" ]; then
+        echo
+        echo "### Acceptance checks (run by local-subagent, not by the model)"
+        cat "$dir/checks.md" 2>/dev/null || echo "(not run)"
+    fi
+    if [ -s "$dir/advisory.md" ]; then
+        echo
+        echo "### Advisory checks (reported only; not sent to the model)"
+        cat "$dir/advisory.md"
+    fi
+    if [ -e "$dir/show_diff" ]; then
+        local lines
+        git -C "$dir/wt" diff --cached > "$dir/diff.txt"
+        lines=$(wc -l < "$dir/diff.txt")
+        echo
+        echo "### Diff"
+        head -n "$DIFF_LINES" "$dir/diff.txt"
+        if [ "$lines" -gt "$DIFF_LINES" ]; then
+            echo "[... $((lines - DIFF_LINES)) more lines. Outline of the rest (files, new definitions and tests):]"
+            tail -n +"$((DIFF_LINES + 1))" "$dir/diff.txt" \
+                | grep -E '^(\+\+\+ |\+[[:space:]]*(async def|def|class|function|func|fn|it\(|test\(|describe\())' | head -n 80 || true
+            echo "[full diff: local-subagent diff $name]"
+        fi
+    fi
+    echo
+    echo "Next: local-subagent diff $name | local-subagent continue $name 'FEEDBACK' | local-subagent apply $name | local-subagent discard $name"
+}
+
+cmd_run() {
+    local name="" model="$MODEL" accept=() advisory=() show_diff=false opt
+    OPTIND=1
+    while getopts "n:m:e:t:c:a:r:T:d" opt; do
+        case $opt in
+            n) name=$OPTARG ;;
+            m) model=$OPTARG ;;
+            e) [[ $OPTARG =~ ^[a-z]+$ ]] || die "-e takes a level name such as low, medium or xhigh"; EFFORT=$OPTARG ;;
+            t) TIMEOUT=$OPTARG ;;
+            c) accept+=("$OPTARG") ;;
+            a) advisory+=("$OPTARG") ;;
+            r) ROUNDS=$OPTARG ;;
+            T) BUDGET=$OPTARG ;;
+            d) show_diff=true ;;
+            *) die "usage: local-subagent run [-n NAME] [-m MODEL] [-e EFFORT] [-t SECONDS] [-c CMD]... [-a CMD]... [-r ROUNDS] [-T SECONDS] [-d] SPEC.md|-" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    local spec=${1:-}
+    if [ "$spec" = - ]; then
+        [ -n "$name" ] || die "give the task a name with -n when the spec comes from stdin"
+    else
+        [ -f "$spec" ] || die "spec file not found: ${spec:-(none)}"
+        [ -n "$name" ] || name=$(basename "$spec" .md)
+    fi
+    name=$(printf '%s' "$name" | tr -c 'A-Za-z0-9._-' '-')
+    [ ! -e "$ROOT/$name" ] || die "task '$name' exists: local-subagent continue/apply/discard $name"
+    command -v opencode >/dev/null || die "opencode is not installed"
+    case $model in ollama/*) curl -sf http://127.0.0.1:11434/api/version >/dev/null || die "Ollama is not running at 127.0.0.1:11434" ;; esac
+    [ -z "$(git -C "$TOP" status --porcelain --untracked-files=no)" ] \
+        || echo "local-subagent: note: your uncommitted changes are not visible to the model (the worktree starts from HEAD)" >&2
+
+    local dir="$ROOT/$name"
+    mkdir -p "$dir"
+    echo $$ > "$dir/pid"
+    git -C "$TOP" worktree add -q -b "subagent/$name" "$dir/wt" HEAD
+    if [ "$spec" = - ]; then cat > "$dir/spec.md"; else cp "$spec" "$dir/spec.md"; fi
+    [ -s "$dir/spec.md" ] || { cleanup "$dir"; die "the spec is empty"; }
+    [ "$show_diff" = true ] && touch "$dir/show_diff"
+    echo "$model" > "$dir/model"
+    [ -z "$EFFORT" ] || echo "$EFFORT" > "$dir/effort"
+    printf '%s %s %s\n' "$TIMEOUT" "$ROUNDS" "$BUDGET" > "$dir/limits"
+    printf '%s\n' "${accept[@]}" | sed '/^$/d' > "$dir/accept"
+    printf '%s\n' "${advisory[@]}" | sed '/^$/d' > "$dir/advisory"
+
+    local checks="" c
+    for c in "${accept[@]}"; do checks+="- \`$c\`"$'\n'; done
+    local msg="You are a coding agent working alone in a git worktree. Do the task below completely, without asking questions.
+Rules:
+- Only read and change files inside the current directory.
+- Do not commit, push, or change git history or branches.
+- Do not install packages or use the network.
+- Before finishing, run each acceptance command yourself once and fix what fails. Do not run slow checks over
+  and over: when you finish, every check runs again and sends you any failure to fix.
+- Delete scratch and helper files you created along the way, unless the task asks for them.
+- Finish with a short summary: what you changed, file by file; how you verified it; anything you could not do.
+Acceptance commands:
+${checks:-- (none given: verify the result as well as you can)}
+--- TASK ---
+$(cat "$dir/spec.md")"
+    lock
+    echo "local-subagent: $model is working on '$name' (${EFFORT:-default} effort; up to $ROUNDS automatic fix rounds; it stops within ${BUDGET} s)..." >&2
+    work "$dir" "$msg"
+    rm -f "$dir/pid"
+    report "$dir"
+}
+
+cmd_continue() {
+    local name=${1:-} feedback=${2:-}
+    [ -n "$name" ] && [ -n "$feedback" ] || die "usage: local-subagent continue NAME 'FEEDBACK'"
+    local dir session
+    dir=$(task_dir "$name")
+    session=$(cat "$dir/session" 2>/dev/null) || die "no model session recorded for '$name'"
+    [ -n "$session" ] || die "no model session recorded for '$name'"
+    [ -s "$dir/limits" ] && read -r TIMEOUT ROUNDS BUDGET < "$dir/limits"
+    ! running "$dir" || die "'$name' is still running: local-subagent report $name"
+    echo $$ > "$dir/pid"
+    lock
+    echo "local-subagent: the model is working on the feedback for '$name'..." >&2
+    work "$dir" "Feedback from the reviewer:
+$feedback
+
+Fix this, run the acceptance commands again, and finish with the same kind of short summary." -s "$session"
+    rm -f "$dir/pid"
+    report "$dir"
+}
+
+# For coordinators whose shell tool cannot wait for a whole run: start run or continue in the background,
+# then call this until it prints the report. It exits with 3 while the task is still running.
+cmd_report() {
+    local wait=540 waited=0 opt name dir
+    OPTIND=1
+    while getopts "w:" opt; do
+        case $opt in
+            w) wait=$OPTARG ;;
+            *) die "usage: local-subagent report [-w SECONDS] NAME" ;;
+        esac
+    done
+    shift $((OPTIND - 1))
+    name=${1:-}
+    [ -n "$name" ] || die "usage: local-subagent report [-w SECONDS] NAME"
+    # A task started in the background a moment ago may not exist yet
+    while [ ! -d "$ROOT/$name/wt" ] && [ "$waited" -lt 30 ]; do sleep 1; waited=$((waited + 1)); done
+    dir=$(task_dir "$name")
+    while running "$dir"; do
+        if [ "$waited" -ge "$wait" ]; then
+            echo "local-subagent: '$name' is still running (started $(( $(date +%s) - $(stat -c %Y "$dir/pid") )) s ago; the model is stopped within ${BUDGET} s); run local-subagent report $name again."
+            exit 3
+        fi
+        sleep 5
+        waited=$((waited + 5))
+    done
+    report "$dir"
+}
+
+cmd_diff() {
+    local dir
+    dir=$(task_dir "${1:-}")
+    git -C "$dir/wt" add -A
+    git -C "$dir/wt" diff --cached
+}
+
+cleanup() {  # TASK_DIR
+    local dir=$1
+    git -C "$TOP" worktree remove --force "$dir/wt"
+    git -C "$TOP" branch -D -q "subagent/$(basename "$dir")" || true
+    rm -rf "$dir"
+}
+
+cmd_apply() {
+    local dir patch
+    dir=$(task_dir "${1:-}")
+    ! running "$dir" || die "'$1' is still running; wait for it (local-subagent report $1) before applying it"
+    git -C "$dir/wt" add -A
+    patch="$dir/changes.patch"
+    git -C "$dir/wt" diff --cached --binary > "$patch"
+    [ -s "$patch" ] || die "no changes to apply"
+    git -C "$TOP" apply --check "$patch" || die "the changes do not apply to your working tree; see local-subagent diff $1"
+    git -C "$TOP" apply "$patch"
+    git -C "$TOP" status --short
+    cleanup "$dir"
+    echo "local-subagent: applied as uncommitted changes; task '$1' removed."
+}
+
+cmd_discard() {
+    local dir
+    dir=$(task_dir "${1:-}")
+    ! running "$dir" || die "'$1' is still running; wait for it (local-subagent report $1) before discarding it"
+    cleanup "$dir"
+    echo "local-subagent: task '$1' discarded."
+}
+
+cmd_list() {
+    local d
+    for d in "$ROOT"/*/; do
+        [ -d "$d/wt" ] || continue
+        printf '%s\t%s changed file(s)%s\n' "$(basename "$d")" \
+            "$(git -C "$d/wt" status --porcelain | wc -l)" "$(running "$d" && echo ", running" || true)"
+    done
+}
+
+case "${1:-}" in
+    run) shift; cmd_run "$@" ;;
+    continue) shift; cmd_continue "$@" ;;
+    report) shift; cmd_report "$@" ;;
+    diff) shift; cmd_diff "$@" ;;
+    apply) shift; cmd_apply "$@" ;;
+    discard) shift; cmd_discard "$@" ;;
+    list) cmd_list ;;
+    *) sed -n '2,/^# =\{10,\}$/p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
+esac
