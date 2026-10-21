@@ -79,12 +79,12 @@ The saving comes from turns. Every turn of the coordinator re-reads its whole co
   Environment=LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_K=q4_0
   Environment=LLAMA_ARG_SPEC_DRAFT_CACHE_TYPE_V=q4_0
   ```
-- **Context size:** the model re-reads its growing session on every step, and steps in the measured test-writing tasks averaged up to about 60K tokens. Use at least 64K; 88K (`num_ctx 90112`) was tested. If it does not fit at `100% GPU`, lower `num_ctx` (about 29 MiB of VRAM per 1K tokens with MTP on) and set OpenCode's `limit.context` to the same number.
+- **Context size:** the model re-reads its growing session on every step, and steps in the measured test-writing tasks averaged up to about 60K tokens. Use at least 64K; 88K (`num_ctx 90112`) was tested. If it does not fit at `100% GPU`, lower `num_ctx` (about 29 MiB of VRAM per 1K tokens with MTP on) and set OpenCode's `limit.context` to the same number. When a session reaches `limit.context` minus `limit.output` (OpenCode subtracts at most 32,000; 73,728 tokens with the OpenCode config below), OpenCode compacts it: it summarises the older steps and the model carries on. That happened in several measured test-writing runs, and they still passed their checks.
 - **Thinking levels:** Qwen3.8 has `low`, `medium` (its default) and `xhigh`. "high" is accepted but behaves like medium. `local-subagent -e LEVEL` chooses one; without `-e` nothing is sent and the model uses its default.
 
 ### Other models
 Any model that OpenCode can run and that calls tools reliably can be the subagent: another Ollama model, or one served by llama.cpp, LM Studio, vLLM or another OpenAI-compatible server. A bigger GPU can run a larger or less quantized model.
-- Add the model to OpenCode's config (below), with `limit.context` equal to the context the server gives it.
+- Add the model to OpenCode's config (below), with `limit.context` equal to the context the server gives it. `local-subagent` refuses a model without it.
 - Select it per task with `-m provider/model`, or for every task with `export LOCAL_SUBAGENT_MODEL=provider/model`.
 - For a model without thinking, set `"reasoning": false` in its OpenCode model entry and do not use `-e`. Otherwise OpenCode asks it for a thinking level (for session titles, too), and a server such as Ollama rejects those requests.
 - `local-subagent` checks that Ollama runs only for `ollama/...` models. For other providers, start the server yourself first.
@@ -118,7 +118,7 @@ Write `~/.config/opencode/opencode.json`:
   }
 }
 ```
-- `limit.context` must equal the model's `num_ctx`; OpenCode compacts the session based on it.
+- `limit.context` must equal the model's `num_ctx`; OpenCode compacts the session based on it. Without a `limit`, OpenCode never compacts, and once the session outgrows `num_ctx`, Ollama silently drops the oldest messages, the task spec first. `local-subagent` therefore refuses a model without `limit.context`, and it turns automatic compaction on for the worker even if your own config or `OPENCODE_DISABLE_AUTOCOMPACT` turns it off.
 - `"temperature": false` lets the Modelfile's sampling apply. `interleaved` sends the model's thinking back to it between tool calls.
 - `enabled_providers` keeps OpenCode on the local model only, and `"share": "disabled"` turns off session sharing. If you also use OpenCode as the coordinator with a cloud model, add that provider to `enabled_providers` and set `model` to it: local-subagent always starts the worker with the local model (`-m`) and makes it the worker's `small_model` too, so the worker stays local.
 - On its first request OpenCode downloads the npm package `@ai-sdk/openai-compatible`, so it needs internet access once (behind a proxy, set `HTTPS_PROXY`).
@@ -243,6 +243,8 @@ local-subagent list                          open tasks of this repository
 | Symptom | Likely cause | What to do |
 |---|---|---|
 | `local-subagent: Ollama is not running at 127.0.0.1:11434` | Service stopped, or Ollama on another address | Start the service; local-subagent expects this address. |
+| `local-subagent: OpenCode does not know the model ...` | The model is not in OpenCode's config, or the name differs | Add it under `provider` (see "OpenCode"); `opencode models PROVIDER` lists the names. |
+| `local-subagent: OpenCode has no context limit for ...` | The model entry has no `limit` | Add `"limit": { "context": NUM_CTX, "output": ... }` to it. |
 | `opencode run` never returns in your own tests | stdin not redirected, or the first-run package download is blocked | Add `< /dev/null`; set `HTTPS_PROXY`. |
 | Report: the model timed out (exit 124) | Task too big, or the model is not fully on the GPU | Check `ollama ps`; split the task, or raise `-t` and `-T` together with the coordinator's command timeout. |
 | The coordinator's command is killed after a few minutes, or the report says "Interrupted" | Its command timeout is shorter than local-subagent's 30 minutes | `local-subagent discard NAME`, then run again with a timeout of at least 40 minutes, in the tool's background mode, or detached with `local-subagent report` (SKILL.md, step 2). |

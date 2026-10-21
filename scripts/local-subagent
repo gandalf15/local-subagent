@@ -37,10 +37,11 @@ BUDGET=1800         # seconds for all model runs of one command together
 DIFF_LINES=150      # diff lines shown in a report before the outline
 ACCEPT_TIMEOUT=600
 # Worker-only OpenCode rules (merged into ~/.config/opencode/opencode.json): stay inside the worktree,
-# no web, no questions (nobody is there to answer), no skills, stop on repeated identical tool calls.
+# no web, no questions (nobody is there to answer), no skills, stop on repeated identical tool calls, and
+# compact the session when it nears the model's context limit, even if the user turned that off for themselves.
 # run_opencode adds the task's model as small_model, so that session titles stay local too when OpenCode also
 # has a cloud provider for other uses, and the thinking effort for OpenCode's default agent when one was given.
-WORKER_CONFIG='{"permission":{"external_directory":"deny","webfetch":"deny","websearch":"deny","question":"deny","skill":"deny","doom_loop":"deny"}}'
+WORKER_CONFIG='{"compaction":{"auto":true},"permission":{"external_directory":"deny","webfetch":"deny","websearch":"deny","question":"deny","skill":"deny","doom_loop":"deny"}}'
 
 die() { echo "local-subagent: $*" >&2; exit 1; }
 
@@ -80,7 +81,7 @@ run_opencode() {  # TASK_DIR SECONDS MESSAGE [extra opencode args...]
     effort=$(cat "$dir/effort" 2>/dev/null || true)
     config="${WORKER_CONFIG%\}},\"small_model\":\"$model\"}"
     [ -z "$effort" ] || config="${config%\}},\"agent\":{\"build\":{\"reasoningEffort\":\"$effort\"}}}"
-    (cd "$dir/wt" && OPENCODE_CONFIG_CONTENT="$config" OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
+    (unset OPENCODE_DISABLE_AUTOCOMPACT; cd "$dir/wt" && OPENCODE_CONFIG_CONTENT="$config" OPENCODE_DISABLE_CLAUDE_CODE_SKILLS=1 OPENCODE_DISABLE_EXTERNAL_SKILLS=1 \
         OPENCODE_DISABLE_AUTOUPDATE=1 PYTHONDONTWRITEBYTECODE=1 timeout "$limit" \
         opencode run --auto -m "$model" --format json "$@" "$msg" \
         < /dev/null >> "$dir/log.jsonl" 2>> "$dir/err") &
@@ -276,6 +277,13 @@ cmd_run() {
     [ ! -e "$ROOT/$name" ] || die "task '$name' exists: local-subagent continue/apply/discard $name"
     command -v opencode >/dev/null || die "opencode is not installed"
     case $model in ollama/*) curl -sf http://127.0.0.1:11434/api/version >/dev/null || die "Ollama is not running at 127.0.0.1:11434" ;; esac
+    # OpenCode compacts the session only for a model with a context limit. Without one, a long session outgrows
+    # the model's context and Ollama silently drops the oldest messages, the spec first.
+    local context
+    context=$(opencode models "${model%%/*}" --verbose 2>/dev/null | awk -v m="$model" \
+        '$0 == m {f = 1; next} f && /^[^ {}]/ {exit} f && /"limit":/ {l = 1} l && /"context":/ {gsub(/[^0-9]/, ""); print; exit}' || true)
+    [ -n "$context" ] || die "OpenCode does not know the model $model: add it to OpenCode's config (see pre-requirements.md)"
+    [ "$context" -gt 0 ] || die "OpenCode has no context limit for $model, so it would never compact the model's session: set limit.context to the model's context size in OpenCode's config (see pre-requirements.md)"
     [ -z "$(git -C "$TOP" status --porcelain --untracked-files=no)" ] \
         || echo "local-subagent: note: your uncommitted changes are not visible to the model (the worktree starts from HEAD)" >&2
 
